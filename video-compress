@@ -1,0 +1,122 @@
+# Set up PATH to find ffmpeg
+export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+timestamp=$(date "+%Y%m%d_%H%M%S")
+logfile="/private/tmp/video_compress_${timestamp}.log"
+
+# Set up logging
+echo "Starting compression at $(date)" > "$logfile"
+echo "Current PATH: $PATH" >> "$logfile"
+echo "FFmpeg location: $(which ffmpeg 2>&1)" >> "$logfile"
+echo "----------------------------------------" >> "$logfile"
+
+# Process each input file
+for input_file in "$@"; do
+    echo "Processing: $input_file" >> "$logfile"
+    echo "Full ffmpeg output:" >> "$logfile"
+    
+    # Get video information
+    video_info=$(ffmpeg -i "$input_file" 2>&1 || true)
+    echo "$video_info" >> "$logfile"
+    echo "----------------------------------------" >> "$logfile"
+    
+    # Extract bitrate
+    current_bitrate=$(echo "$video_info" | grep -o "bitrate: [0-9]* kb/s" | grep -o "[0-9]*")
+    echo "Bitrate found: ${current_bitrate}k" >> "$logfile"
+    
+    # Extract resolution from the Video stream line
+    resolution_line=$(echo "$video_info" | grep "Stream.*Video" | head -n1)
+    echo "Resolution line: $resolution_line" >> "$logfile"
+    
+    # Extract resolution pattern after yuv420p and before kb/s
+    resolution=$(echo "$resolution_line" | grep -o 'yuv420p[^,]*, [0-9]\+x[0-9]\+' | grep -o '[0-9]\+x[0-9]\+')
+    if [ -z "$resolution" ]; then
+        # Fallback: try to find any NxN pattern that's not a stream ID (0xN)
+        resolution=$(echo "$resolution_line" | grep -o '[0-9]\+x[0-9]\+' | grep -v '^0x' | head -n1)
+    fi
+    width=$(echo "$resolution" | cut -dx -f1)
+    height=$(echo "$resolution" | cut -dx -f2)
+    echo "Resolution found: ${width}x${height}" >> "$logfile"
+    
+    # Now check if we got valid numbers
+    if [[ "$width" =~ ^[0-9]+$ ]] && [[ "$height" =~ ^[0-9]+$ ]]; then
+        if (( height > 720 )); then
+            echo "Will scale down to 720p" >> "$logfile"
+            target_height=720
+        elif (( height > 480 && height < 720 )); then
+            echo "Will scale down to 480p" >> "$logfile"
+            target_height=480
+        else
+            echo "Will maintain original resolution" >> "$logfile"
+            target_height=$height
+        fi
+    else
+        echo "Failed to parse resolution properly" >> "$logfile"
+        echo "Raw resolution value: $resolution" >> "$logfile"
+        continue
+    fi
+    
+    # Set CRF based on bitrate - using more aggressive compression
+    if (( current_bitrate > 5000 )); then
+        echo "High bitrate video detected" >> "$logfile"
+        target_crf=28
+    else
+        echo "Normal bitrate video detected" >> "$logfile"
+        target_crf=26
+    fi
+    echo "Selected CRF: $target_crf" >> "$logfile"
+    
+    # Calculate scaling parameters ensuring even dimensions
+    # First, calculate the aspect ratio multiplier
+    aspect_ratio=$(echo "scale=4; $width / $height" | bc)
+    
+    # Calculate new dimensions maintaining aspect ratio
+    if (( target_height != height )); then
+        scale_h=$target_height
+        # Calculate width based on aspect ratio and round to even number
+        scale_w=$(echo "scale=0; ($target_height * $aspect_ratio + 0.5)/1" | bc)
+        scale_w=$((scale_w + scale_w % 2)) # Ensure even width
+    else
+        # No height change needed, just ensure even dimensions
+        scale_h=$((height - height % 2))
+        scale_w=$((width - width % 2))
+    fi
+    
+    # Generate output filename with timestamp and dimensions
+    output_dir=$(dirname "$input_file")
+    filename=$(basename "$input_file")
+    filename_noext="${filename%.*}"
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    output_file="${output_dir}/${filename_noext}_${scale_w}x${scale_h}_compressed_${timestamp}.mp4"
+    
+    echo "Scaling to ${scale_w}x${scale_h}" >> "$logfile"
+    echo "Output file: $output_file" >> "$logfile"
+    
+    # Perform the compression
+    ffmpeg -i "$input_file" \
+        -c:v libx264 -crf "$target_crf" \
+        -vf "scale=${scale_w}:${scale_h}" \
+        -preset medium \
+        -c:a aac -b:a 128k \
+        "$output_file" 2>> "$logfile"
+    
+    if [ $? -eq 0 ]; then
+        echo "Compression completed successfully" >> "$logfile"
+        
+        # Get original and new file sizes
+        original_size=$(stat -f "%z" "$input_file")
+        compressed_size=$(stat -f "%z" "$output_file")
+        original_mb=$(echo "scale=2; $original_size / 1048576" | bc)
+        compressed_mb=$(echo "scale=2; $compressed_size / 1048576" | bc)
+        reduction=$(echo "scale=2; 100 - ($compressed_size * 100 / $original_size)" | bc)
+        
+        echo "Original size: ${original_mb}MB" >> "$logfile"
+        echo "Compressed size: ${compressed_mb}MB" >> "$logfile"
+        echo "Size reduction: ${reduction}%" >> "$logfile"
+    else
+        echo "Error during compression" >> "$logfile"
+    fi
+done
+
+echo "----------------------------------------" >> "$logfile"
+echo "Script completed at $(date)" >> "$logfile"
